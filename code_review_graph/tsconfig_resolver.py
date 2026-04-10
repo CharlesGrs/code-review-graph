@@ -16,7 +16,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # Extensions probed when resolving an alias target
-_PROBE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".vue"]
+_PROBE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte", ".svelte.ts"]
 
 # Tsconfig filenames to look for when walking up the directory tree
 _TSCONFIG_NAMES = ["tsconfig.json", "tsconfig.app.json"]
@@ -50,6 +50,17 @@ class TsconfigResolver:
                 base_dir = (Path(tsconfig_dir) / base_url).resolve()
             else:
                 base_dir = Path(tsconfig_dir).resolve()
+
+            # SvelteKit fix: $lib paths from .svelte-kit/tsconfig.json use
+            # relative targets like "../src/lib" which are relative to the
+            # .svelte-kit/ directory, not the project root. Detect and fix.
+            if "$lib" in paths or "$lib/*" in paths:
+                src_lib = (base_dir / "src" / "lib").resolve()
+                if src_lib.is_dir():
+                    fixed_paths = dict(paths)
+                    fixed_paths["$lib"] = ["./src/lib"]
+                    fixed_paths["$lib/*"] = ["./src/lib/*"]
+                    return self._match_and_probe(import_str, fixed_paths, base_dir)
 
             return self._match_and_probe(import_str, paths, base_dir)
         except Exception:
@@ -246,9 +257,18 @@ def _probe_path(base: Path) -> Optional[Path]:
     if base.is_file():
         return base
     for ext in _PROBE_EXTENSIONS:
-        candidate = base.with_suffix(ext) if not base.suffix else Path(str(base) + ext)
+        # Always append to the full path string to handle compound extensions
+        # like .svelte.ts correctly (Path.with_suffix would replace .svelte)
+        candidate = Path(str(base) + ext)
         if candidate.is_file():
             return candidate
+    # Also try replacing the suffix for simple extensions
+    if base.suffix:
+        for ext in _PROBE_EXTENSIONS:
+            if "." not in ext[1:]:  # Only single-dot extensions
+                candidate = base.with_suffix(ext)
+                if candidate.is_file():
+                    return candidate
     if base.is_dir():
         for ext in _PROBE_EXTENSIONS:
             candidate = base / f"index{ext}"

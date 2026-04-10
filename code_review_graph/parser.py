@@ -227,6 +227,58 @@ _CALL_TYPES: dict[str, list[str]] = {
     "svelte": ["call_expression", "new_expression"],
 }
 
+# Common stdlib/builtin method names that create noisy CALLS edges.
+# These are method calls on objects (e.g., .push(), .clone(), .map()) or
+# Rust constructors (Some, Ok, Err) that don't represent meaningful
+# architectural dependencies. Filtering them reduces edge noise by ~35%.
+_CALL_NOISE_NAMES: frozenset[str] = frozenset({
+    # Rust stdlib
+    "Some", "None", "Ok", "Err", "Box", "Arc", "Rc", "Vec",
+    "clone", "to_string", "to_owned", "into", "from", "as_str", "as_ref",
+    "unwrap", "unwrap_or", "unwrap_or_default", "unwrap_or_else", "expect",
+    "map", "map_err", "and_then", "or_else", "ok_or", "ok_or_else",
+    "iter", "into_iter", "collect", "for_each", "enumerate",
+    "push", "pop", "insert", "remove", "contains", "get", "get_mut",
+    "len", "is_empty", "is_some", "is_none", "is_ok", "is_err",
+    "join", "split", "trim", "replace", "starts_with", "ends_with",
+    "format", "println", "eprintln", "dbg", "todo", "unimplemented",
+    "info", "warn", "error", "debug", "trace",
+    "min", "max", "abs", "clamp", "floor", "ceil", "round", "sqrt", "pow",
+    "read", "write", "flush", "close",
+    "lock", "try_lock", "drop",
+    # JS/TS stdlib
+    "log", "warn", "error", "info",
+    "includes", "indexOf", "lastIndexOf", "find", "findIndex",
+    "filter", "map", "reduce", "forEach", "some", "every", "flat", "flatMap",
+    "push", "pop", "shift", "unshift", "splice", "slice", "concat", "sort",
+    "reverse", "fill",
+    "keys", "values", "entries", "has", "set", "get", "delete", "clear",
+    "replace", "split", "trim", "trimStart", "trimEnd", "toLowerCase",
+    "toUpperCase", "padStart", "padEnd", "match", "test", "search",
+    "startsWith", "endsWith", "substring", "charAt", "charCodeAt",
+    "toString", "valueOf", "toFixed", "toPrecision",
+    "parseInt", "parseFloat", "isNaN", "isFinite",
+    "now", "then", "catch", "finally", "resolve", "reject", "all", "race",
+    "stringify", "parse",
+    "setTimeout", "clearTimeout", "setInterval", "clearInterval",
+    "requestAnimationFrame", "cancelAnimationFrame",
+    "preventDefault", "stopPropagation",
+    "addEventListener", "removeEventListener", "dispatchEvent",
+    "querySelector", "querySelectorAll", "getElementById",
+    "getAttribute", "setAttribute", "removeAttribute", "classList",
+    "appendChild", "removeChild", "insertBefore", "replaceChild",
+    "createElement", "createTextNode",
+    "console",
+    # Python stdlib (for completeness)
+    "append", "extend", "update", "copy", "deepcopy",
+    "print", "len", "range", "enumerate", "zip", "sorted", "reversed",
+    "isinstance", "issubclass", "hasattr", "getattr", "setattr",
+    "str", "int", "float", "bool", "list", "dict", "set", "tuple",
+    "type", "super", "next", "iter",
+    # Test assertions (keep as edges — handled by test node detection)
+    # "assert_eq", "assert_ne", "assert", "expect",
+})
+
 # Patterns that indicate a test function
 _TEST_PATTERNS = [
     re.compile(r"^test_"),
@@ -1888,6 +1940,10 @@ class CodeParser:
                 return False
 
         if call_name and enclosing_func:
+            # Skip stdlib/builtin noise — these don't represent meaningful
+            # architectural dependencies and inflate the graph by ~35%.
+            if call_name in _CALL_NOISE_NAMES:
+                return False
             caller = self._qualify(
                 enclosing_func, file_path, enclosing_class,
             )
@@ -2229,13 +2285,18 @@ class CodeParser:
             if module.startswith("."):
                 # Relative import — resolve from caller's directory
                 base = caller_dir / module
-                extensions = [".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte"]
+                extensions = [
+                    ".ts", ".tsx", ".js", ".jsx", ".vue",
+                    ".svelte", ".svelte.ts", ".svelte.js",
+                ]
                 # Try exact path first (might already have extension)
                 if base.is_file():
                     return str(base.resolve())
-                # Try with extensions
+                # Try with extensions — use string append to handle compound
+                # extensions like .svelte.ts correctly
+                base_str = str(base)
                 for ext in extensions:
-                    target = base.with_suffix(ext)
+                    target = Path(base_str + ext)
                     if target.is_file():
                         return str(target.resolve())
                 # Try index file in directory

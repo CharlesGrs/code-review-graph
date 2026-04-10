@@ -3,14 +3,85 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import time
+from pathlib import Path
 from typing import Any
 
 from ..incremental import full_build, incremental_update
 from ._common import _get_store
 
 logger = logging.getLogger(__name__)
+
+# Pattern: #[tauri::command] followed by fn name (with optional pub/async)
+_TAURI_CMD_RE = re.compile(
+    r"#\[tauri::command\]\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)",
+)
+
+
+def _resolve_tauri_edges(store: Any) -> int:
+    """Link tauri::cmd_name edge targets to actual Rust function qualified names.
+
+    Scans Rust source files for #[tauri::command] annotations, builds a map
+    of command_name -> qualified_name, then rewrites CALLS edges whose target
+    starts with 'tauri::' to point at the real Rust function.
+    """
+    conn = store._conn
+
+    # Step 1: Find all Rust files in the graph
+    rust_files = conn.execute(
+        "SELECT DISTINCT file_path FROM nodes WHERE language = 'rust'"
+    ).fetchall()
+
+    # Step 2: Scan source files for #[tauri::command] fn name
+    cmd_to_qualified: dict[str, str] = {}
+    for (file_path,) in rust_files:
+        try:
+            source = Path(file_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for match in _TAURI_CMD_RE.finditer(source):
+            fn_name = match.group(1)
+            # Find the qualified name of this function in the graph
+            row = conn.execute(
+                "SELECT qualified_name FROM nodes "
+                "WHERE name = ? AND file_path = ? AND kind = 'Function'",
+                (fn_name, file_path),
+            ).fetchone()
+            if row:
+                cmd_to_qualified[fn_name] = row[0]
+
+    if not cmd_to_qualified:
+        return 0
+
+    # Step 3: Rewrite tauri::X edges to point to the actual Rust function
+    tauri_edges = conn.execute(
+        "SELECT id, target_qualified FROM edges "
+        "WHERE target_qualified LIKE 'tauri::%'"
+    ).fetchall()
+
+    linked = 0
+    now = time.time()
+    for edge_id, target in tauri_edges:
+        cmd_name = target.replace("tauri::", "", 1)
+        if cmd_name in cmd_to_qualified:
+            conn.execute(
+                "UPDATE edges SET target_qualified = ?, "
+                "extra = json_set(COALESCE(extra, '{}'), '$.cross_language', 'tauri'), "
+                "updated_at = ? WHERE id = ?",
+                (cmd_to_qualified[cmd_name], now, edge_id),
+            )
+            linked += 1
+
+    if linked:
+        conn.commit()
+        logger.info(
+            "Tauri cross-language: linked %d invoke() calls to %d Rust commands",
+            linked, len(cmd_to_qualified),
+        )
+
+    return linked
 
 
 def _run_postprocess(
@@ -108,6 +179,15 @@ def _run_postprocess(
     except (sqlite3.OperationalError, ImportError) as e:
         logger.warning("Community detection failed: %s", e)
         warnings.append(f"Community detection failed: {type(e).__name__}: {e}")
+
+    # -- Cross-language edges (Tauri invoke -> Rust command) --
+    try:
+        tauri_linked = _resolve_tauri_edges(store)
+        if tauri_linked:
+            build_result["tauri_edges_linked"] = tauri_linked
+    except (sqlite3.OperationalError, Exception) as e:
+        logger.warning("Tauri edge resolution failed: %s", e)
+        warnings.append(f"Tauri edge resolution failed: {type(e).__name__}: {e}")
 
     # -- Compute pre-computed summary tables --
     try:

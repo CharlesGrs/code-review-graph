@@ -102,6 +102,7 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".xs": "c",  # Perl XS: parsed as C to capture functions/structs/includes
     ".lua": "lua",
     ".ipynb": "notebook",
+    ".svelte": "svelte",
 }
 
 # Tree-sitter node type mappings per language
@@ -136,6 +137,7 @@ _CLASS_TYPES: dict[str, list[str]] = {
     ],
     "dart": ["class_definition", "mixin_declaration", "enum_declaration"],
     "lua": [],  # Lua has no class keyword; table-based OOP handled via constructs handler
+    "svelte": ["class_declaration", "class"],
 }
 
 _FUNCTION_TYPES: dict[str, list[str]] = {
@@ -170,6 +172,7 @@ _FUNCTION_TYPES: dict[str, list[str]] = {
     # function_signature inside it).
     "dart": ["function_signature"],
     "lua": ["function_declaration"],
+    "svelte": ["function_declaration", "method_definition", "arrow_function"],
 }
 
 _IMPORT_TYPES: dict[str, list[str]] = {
@@ -195,6 +198,7 @@ _IMPORT_TYPES: dict[str, list[str]] = {
     "dart": ["import_or_export"],
     # Lua: require() is a function_call, handled via _extract_lua_constructs
     "lua": [],
+    "svelte": ["import_statement"],
 }
 
 _CALL_TYPES: dict[str, list[str]] = {
@@ -220,6 +224,7 @@ _CALL_TYPES: dict[str, list[str]] = {
     "scala": ["call_expression", "instance_expression", "generic_function"],
     "solidity": ["call_expression"],
     "lua": ["function_call"],
+    "svelte": ["call_expression", "new_expression"],
 }
 
 # Patterns that indicate a test function
@@ -329,6 +334,10 @@ class CodeParser:
         # Vue SFCs: parse with vue parser, then delegate script blocks to JS/TS
         if language == "vue":
             return self._parse_vue(path, source)
+
+        # Svelte SFCs: parse with svelte parser, then delegate script blocks to JS/TS
+        if language == "svelte":
+            return self._parse_svelte(path, source)
 
         # Jupyter notebooks: extract code cells and parse as Python
         if language == "notebook":
@@ -486,6 +495,120 @@ class CodeParser:
 
             all_nodes.extend(nodes)
             all_edges.extend(edges)
+
+        # Generate TESTED_BY edges
+        if test_file:
+            test_qnames = set()
+            for n in all_nodes:
+                if n.is_test:
+                    qn = self._qualify(n.name, n.file_path, n.parent_name)
+                    test_qnames.add(qn)
+            for edge in list(all_edges):
+                if edge.kind == "CALLS" and edge.source in test_qnames:
+                    all_edges.append(EdgeInfo(
+                        kind="TESTED_BY",
+                        source=edge.target,
+                        target=edge.source,
+                        file_path=edge.file_path,
+                        line=edge.line,
+                    ))
+
+        return all_nodes, all_edges
+
+    def _parse_svelte(
+        self, path: Path, source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Parse a Svelte SFC by extracting <script> blocks and delegating to JS/TS."""
+        svelte_parser = self._get_parser("svelte")
+        if not svelte_parser:
+            return [], []
+
+        tree = svelte_parser.parse(source)
+        file_path_str = str(path)
+        test_file = _is_test_file(file_path_str)
+
+        all_nodes: list[NodeInfo] = [NodeInfo(
+            kind="File",
+            name=file_path_str,
+            file_path=file_path_str,
+            line_start=1,
+            line_end=source.count(b"\n") + 1,
+            language="svelte",
+            is_test=test_file,
+        )]
+        all_edges: list[EdgeInfo] = []
+
+        # Find script_element blocks in the Svelte AST
+        for child in tree.root_node.children:
+            if child.type != "script_element":
+                continue
+
+            # Detect language from lang="ts" attribute
+            script_lang = "javascript"
+            start_tag = None
+            raw_text_node = None
+            for sub in child.children:
+                if sub.type == "start_tag":
+                    start_tag = sub
+                elif sub.type == "raw_text":
+                    raw_text_node = sub
+
+            if start_tag:
+                for attr in start_tag.children:
+                    if attr.type == "attribute":
+                        attr_name = None
+                        attr_value = None
+                        for a in attr.children:
+                            if a.type == "attribute_name":
+                                attr_name = a.text.decode("utf-8", errors="replace")
+                            elif a.type == "quoted_attribute_value":
+                                for v in a.children:
+                                    if v.type == "attribute_value":
+                                        attr_value = v.text.decode(
+                                            "utf-8", errors="replace",
+                                        )
+                        if attr_name == "lang" and attr_value in ("ts", "typescript"):
+                            script_lang = "typescript"
+
+            if not raw_text_node:
+                continue
+
+            script_source = raw_text_node.text
+            line_offset = raw_text_node.start_point[0]  # 0-based line of raw_text start
+
+            # Parse the script block with the appropriate JS/TS parser
+            script_parser = self._get_parser(script_lang)
+            if not script_parser:
+                continue
+
+            script_tree = script_parser.parse(script_source)
+
+            # Collect imports and defined names from the script block
+            import_map, defined_names = self._collect_file_scope(
+                script_tree.root_node, script_lang, script_source,
+            )
+
+            nodes: list[NodeInfo] = []
+            edges: list[EdgeInfo] = []
+            self._extract_from_tree(
+                script_tree.root_node, script_source, script_lang,
+                file_path_str, nodes, edges,
+                import_map=import_map, defined_names=defined_names,
+            )
+
+            # Adjust line numbers to account for position within the .svelte file
+            for node in nodes:
+                node.line_start += line_offset
+                node.line_end += line_offset
+                node.language = "svelte"
+            for edge in edges:
+                edge.line += line_offset
+
+            all_nodes.extend(nodes)
+            all_edges.extend(edges)
+
+        # Resolve bare call targets
+        all_edges = self._resolve_call_targets(all_nodes, all_edges, file_path_str)
 
         # Generate TESTED_BY edges
         if test_file:
@@ -1743,6 +1866,27 @@ class CodeParser:
             )
             return True
 
+        # Detect Tauri invoke('command_name') calls in JS/TS/Svelte
+        if (
+            call_name == "invoke"
+            and language in ("javascript", "typescript", "tsx", "svelte")
+            and enclosing_func
+        ):
+            invoke_cmd = self._extract_invoke_arg(child, source)
+            if invoke_cmd:
+                caller = self._qualify(
+                    enclosing_func, file_path, enclosing_class,
+                )
+                edges.append(EdgeInfo(
+                    kind="CALLS",
+                    source=caller,
+                    target=f"tauri::{invoke_cmd}",
+                    file_path=file_path,
+                    line=child.start_point[0] + 1,
+                    extra={"tauri_invoke": True},
+                ))
+                return False
+
         if call_name and enclosing_func:
             caller = self._qualify(
                 enclosing_func, file_path, enclosing_class,
@@ -2081,11 +2225,11 @@ class CodeParser:
                     break
                 current = current.parent
 
-        elif language in ("javascript", "typescript", "tsx", "vue"):
+        elif language in ("javascript", "typescript", "tsx", "vue", "svelte"):
             if module.startswith("."):
                 # Relative import — resolve from caller's directory
                 base = caller_dir / module
-                extensions = [".ts", ".tsx", ".js", ".jsx", ".vue"]
+                extensions = [".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte"]
                 # Try exact path first (might already have extension)
                 if base.is_file():
                     return str(base.resolve())
@@ -2538,6 +2682,26 @@ class CodeParser:
                 for inner in child.children:
                     if inner.type == "identifier":
                         return inner.text.decode("utf-8", errors="replace")
+        return None
+
+    # ------------------------------------------------------------------
+    # Tauri invoke() argument extraction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_invoke_arg(call_node, source: bytes) -> Optional[str]:
+        """Extract the command name string from invoke('cmd_name', ...) calls."""
+        for child in call_node.children:
+            if child.type == "arguments":
+                for arg in child.children:
+                    # Skip punctuation tokens: (, ), ,
+                    if arg.type in ("(", ")", ","):
+                        continue
+                    if arg.type in ("string", "template_string"):
+                        raw = arg.text.decode("utf-8", errors="replace")
+                        return raw.strip("'\"`")
+                    # First real argument is not a string — bail
+                    return None
         return None
 
     # ------------------------------------------------------------------
